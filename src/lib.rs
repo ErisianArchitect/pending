@@ -93,16 +93,14 @@ struct Inner<R> {
 }
 
 impl<R> Inner<R> {
-    const fn layout() -> Layout {
-        Layout::new::<Self>()
-    }
+    const LAYOUT: Layout = Layout::new::<Self>();
 
     fn alloc_new() -> NonNull<Inner<R>> {
         unsafe {
-            let layout = Self::layout();
+            let layout = Self::LAYOUT;
             let ptr = alloc(layout) as *mut Self;
             let Some(raw) = NonNull::new(ptr) else {
-                ::std::alloc::handle_alloc_error(Self::layout());
+                ::std::alloc::handle_alloc_error(Self::LAYOUT);
             };
             raw.write(Self {
                 result: UnsafeCell::new(MaybeUninit::uninit()),
@@ -137,7 +135,7 @@ impl<R> Inner<R> {
                 READY => inner_mut.result.get_mut().assume_init_drop(),
                 unknown => unreachable!("Unknown state: {unknown}"),
             }
-            dealloc(raw.as_ptr().cast(), Self::layout());
+            dealloc(raw.as_ptr().cast(), Self::LAYOUT);
         }
 
     }
