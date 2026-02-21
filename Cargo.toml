@@ -1,11 +1,16 @@
 [package]
 name = "pending"
+authors = ["ErisianArchitect <https://github.com/ErisianArchitect>"]
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/ErisianArchitect/pending"
+description = "A library for a lockfree worker thread responder for communicating a value back to the caller thread."
+license-file = "LICENSE"
+readme = "README.md"
+documentation = "https://docs.rs/pending"
 
 [features]
-default = ["rayon"]
-
+default = []
 rayon = ["dep:rayon"]
 
 [dependencies]

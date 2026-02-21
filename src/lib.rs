@@ -299,3 +299,41 @@ where
 {
     Pending::spawn::<S, _>(worker)
 }
+
+#[must_use]
+#[inline]
+pub fn spawn_std<R, F>(worker: F) -> <strategy::Std as strategy::SpawnStrategy>::Return<Pending<R>>
+where
+    R: Send + 'static,
+    F: FnOnce() -> R + Send + 'static,
+{
+    spawn::<strategy::Std, R, F>(worker)
+}
+
+#[cfg(feature = "rayon")]
+#[must_use]
+#[inline]
+pub fn spawn_rayon<R, F>(worker: F) -> <strategy::Rayon as strategy::SpawnStrategy>::Return<Pending<R>> {
+    spawn::<strategy::Rayon, R, F>(worker)
+}
+
+#[test]
+fn main_test() {
+    use std::thread::sleep;
+    use std::time::Duration;
+    let (pending, join_handle) = spawn::<strategy::Std, _, _>(|| {
+        sleep(Duration::from_secs(3));
+        0xDEADBEEFu32
+    });
+
+    sleep(Duration::from_millis(2750));
+    if let Ok(result) = pending.try_recv() {
+        println!("Result: 0x{result:0X}");
+    } else {
+        join_handle.join().expect("Failed to join.");
+        let Ok(result) = pending.try_recv() else {
+            panic!("Thread was joined with no response.");
+        };
+        println!("Result after join: 0x{result:0X}");
+    }
+}
