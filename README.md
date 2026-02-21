@@ -15,13 +15,13 @@ use pending::{
 };
 
 fn main() {
-    
     let (pending, join_handle) = spawn::<strategy::Std, _, _>(|| {
         sleep(Duration::from_secs(3));
         0xDEADBEEFu32
     });
-
+    
     sleep(Duration::from_millis(2750));
+    
     if let Ok(result) = pending.try_recv() {
         println!("Result: 0x{result:0X}");
     } else {
