@@ -1,0 +1,13 @@
+[package]
+name = "pending"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["rayon"]
+
+rayon = ["dep:rayon"]
+
+[dependencies]
+rayon = { version = "1.11.0", optional = true }
+thiserror = "2.0.18"
