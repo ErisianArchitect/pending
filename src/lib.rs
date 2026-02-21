@@ -98,7 +98,7 @@ impl<R> Inner<R> {
     fn alloc_new() -> NonNull<Inner<R>> {
         unsafe {
             let layout = Self::LAYOUT;
-            let ptr = alloc(layout) as *mut Self;
+            let ptr = alloc(layout).cast();
             let Some(raw) = NonNull::new(ptr) else {
                 ::std::alloc::handle_alloc_error(Self::LAYOUT);
             };
