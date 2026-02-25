@@ -23,7 +23,7 @@
 use std::{
     alloc::{
         Layout, alloc, dealloc, handle_alloc_error
-    }, cell::UnsafeCell, mem::{
+    }, cell::UnsafeCell, marker::PhantomData, mem::{
         MaybeUninit,
         transmute,
     }, ptr::NonNull, sync::atomic::{AtomicU8, Ordering}
@@ -289,65 +289,87 @@ impl<R> Inner<R> {
     }
 }
 
+mod marker {
+    pub trait HandleType: Send + Sized + 'static {}
+    
+    #[derive(Debug)]
+    pub enum Sender {}
+    #[derive(Debug)]
+    pub enum Receiver {}
+    
+    impl HandleType for Sender {}
+    impl HandleType for Receiver {}
+    impl HandleType for () {}
+}
+
 #[repr(transparent)]
 #[derive(Debug)]
-struct Handle<R> {
+struct Handle<R, Type: marker::HandleType = ()> {
     raw: NonNull<Inner<R>>,
+    _phantom: PhantomData<*const Type>,
 }
 
-impl<R: Send + 'static> Handle<R> {
+type SendHandle<R> = Handle<R, marker::Sender>;
+type RecvHandle<R> = Handle<R, marker::Receiver>;
+type SpawnOutput<R, S> = <S as strategy::SpawnStrategy>::Return<Pending<R>>;
+
+impl<R: Send + 'static> Handle<R, ()> {
     #[must_use]
     #[inline(always)]
-    fn pair() -> (Handle<R>, Handle<R>) {
+    fn pair() -> (Handle<R, marker::Receiver>, Handle<R, marker::Sender>) {
         let raw = Inner::<R>::alloc_new();
         (
-            Handle { raw },
-            Handle { raw },
+            Handle::from_raw(raw),
+            Handle::from_raw(raw),
         )
-    }
-    
-    #[inline(always)]
-    unsafe fn as_ref<'a>(&'a self) -> &'a Inner<R> {
-        unsafe { self.raw.as_ref() }
     }
 }
 
-impl<R> Drop for Handle<R> {
-    fn drop(&mut self) {
-        // SAFETY: Handle is only ever created in pairs, and the ref count always starts at 2, so
-        // dropping each handle in the pair will bring the ref count to zero. The only way this
-        // operation becomes unsafe is if an extra handle were created from the same raw pointer.
-        unsafe {
-            Inner::<R>::decrement_ref_count_and_maybe_free(self.raw);
+impl<R: Send + 'static, Type: marker::HandleType> Handle<R, Type> {
+    #[must_use]
+    #[inline(always)]
+    const fn from_raw(raw: NonNull<Inner<R>>) -> Self {
+        Self {
+            raw,
+            _phantom: PhantomData,
         }
     }
 }
 
-/// A oneshot single-producer/single-consumer receiver that works in tandem with [Responder<R>].
-#[repr(transparent)]
-#[derive(Debug)]
-pub struct Pending<R: Send + 'static> {
-    handle: Handle<R>,
-}
-
-/// A oneshot single-producer/single-consumer sender that works in tandem with [Pending<R>].
-#[repr(transparent)]
-#[derive(Debug)]
-pub struct Responder<R: Send + 'static> {
-    handle: Handle<R>,
-}
-
-impl<R: Send + 'static> Responder<R> {
-
+impl<R> Handle<R, marker::Receiver>
+where R: Send + 'static {
     #[inline(always)]
-    pub fn respond(self, result: R) {
+    fn is_ready(&self) -> bool {
+        let inner_ref = unsafe {
+            self.raw.as_ref()
+        };
+        inner_ref.state.is_ready()
+    }
+    
+    #[inline(always)]
+    fn try_recv(&self) -> Result<R, Reason> {
+        // SAFETY: handle is valid while self is alive.
+        let inner_ref = unsafe { self.raw.as_ref() };
+        inner_ref.state
+            .take_if_ready()
+            .map(move |_| {
+                // SAFETY: Handle now has exclusive access to the response.
+                unsafe { inner_ref.response.get().read().assume_init() }
+            })
+    }
+}
+
+impl<R> Handle<R, marker::Sender>
+where R: Send + 'static {
+    #[inline(always)]
+    fn respond(self, result: R) {
         // It might appear as if there is an aliasing bug in this code since `Inner` is
         // repr(C), and `response` is the first field, but `response` is UnsafeCell, which
         // prevents aliasing bugs.
         
         // SAFETY: self.handle is guaranteed to be convertible to a reference.
         let inner_ref = unsafe {
-            self.handle.as_ref()
+            self.raw.as_ref()
         };
         // We use store because this is the only thing that can modify the value
         // while the state is `Waiting`, and the state is always waiting until `respond`
@@ -363,8 +385,39 @@ impl<R: Send + 'static> Responder<R> {
     }
 }
 
-impl<R: Send + 'static> Pending<R> {
+impl<R, Type: marker::HandleType> Drop for Handle<R, Type> {
+    fn drop(&mut self) {
+        // SAFETY: Handle is only ever created in pairs, and the ref count always starts at 2, so
+        // dropping each handle in the pair will bring the ref count to zero. The only way this
+        // operation becomes unsafe is if an extra handle were created from the same raw pointer.
+        unsafe {
+            Inner::<R>::decrement_ref_count_and_maybe_free(self.raw);
+        }
+    }
+}
 
+/// A oneshot single-producer/single-consumer receiver that works in tandem with [Responder<R>].
+#[repr(transparent)]
+#[derive(Debug)]
+pub struct Pending<R: Send + 'static> {
+    handle: RecvHandle<R>,
+}
+
+/// A oneshot single-producer/single-consumer sender that works in tandem with [Pending<R>].
+#[repr(transparent)]
+#[derive(Debug)]
+pub struct Responder<R: Send + 'static> {
+    handle: SendHandle<R>,
+}
+
+impl<R: Send + 'static> Responder<R> {
+    #[inline(always)]
+    pub fn respond(self, result: R) {
+        self.handle.respond(result);
+    }
+}
+
+impl<R: Send + 'static> Pending<R> {
     #[must_use]
     #[inline]
     pub fn pair() -> (Pending<R>, Responder<R>) {
@@ -375,6 +428,7 @@ impl<R: Send + 'static> Pending<R> {
         )
     }
     
+    #[must_use]
     pub fn spawn<S, F>(worker: F) -> S::Return<Self>
     where
         S: strategy::SpawnStrategy,
@@ -386,25 +440,15 @@ impl<R: Send + 'static> Pending<R> {
         })
     }
 
-    #[inline]
-    pub fn is_ready(&self) -> bool {
-        let inner_ref = unsafe {
-            self.handle.as_ref()
-        };
-        inner_ref.state.is_ready()
-    }
-
     #[must_use]
     #[inline]
+    pub fn is_ready(&self) -> bool {
+        self.handle.is_ready()
+    }
+
+    #[inline]
     pub fn try_recv(&self) -> Result<R, Reason> {
-        // SAFETY: handle is valid while self is alive.
-        let inner_ref = unsafe { self.handle.as_ref() };
-        inner_ref.state
-            .take_if_ready()
-            .map(move |_| {
-                // SAFETY: Pending now has exclusive access to the result.
-                unsafe { inner_ref.response.get().read().assume_init() }
-            })
+        self.handle.try_recv()
     }
 }
 
@@ -432,7 +476,7 @@ where R: Send + 'static {
 
 #[must_use]
 #[inline]
-pub fn spawn<S, R, F>(worker: F) -> S::Return<Pending<R>>
+pub fn spawn<S, R, F>(worker: F) -> SpawnOutput<R, S>
 where
     S: strategy::SpawnStrategy,
     R: Send + 'static,
@@ -443,7 +487,7 @@ where
 
 #[must_use]
 #[inline]
-pub fn spawn_std<R, F>(worker: F) -> <strategy::Std as strategy::SpawnStrategy>::Return<Pending<R>>
+pub fn spawn_std<R, F>(worker: F) -> SpawnOutput<R, strategy::Std>
 where
     R: Send + 'static,
     F: FnOnce() -> R + Send + 'static,
@@ -454,6 +498,6 @@ where
 #[cfg(feature = "rayon")]
 #[must_use]
 #[inline]
-pub fn spawn_rayon<R, F>(worker: F) -> <strategy::Rayon as strategy::SpawnStrategy>::Return<Pending<R>> {
+pub fn spawn_rayon<R, F>(worker: F) -> SpawnOutput<R, strategy::Rayon> {
     spawn::<strategy::Rayon, R, F>(worker)
 }
