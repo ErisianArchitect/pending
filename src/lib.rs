@@ -29,16 +29,27 @@ use std::{
     }, ptr::NonNull, sync::atomic::{AtomicU8, Ordering}
 };
 
+/// The [strategy] module contains the [strategy::SpawnStrategy] trait, as well as
+/// markers for different strategies. These strategies define how workers are spawned.
 pub mod strategy {
+    
     pub trait SpawnStrategy {
         type Return<T>;
-        fn spawn<F: FnOnce() + Send + 'static, T>(with: T, f: F) -> Self::Return<T>;
+        /// Spawn a worker, passing in part of the return value.
+        /// 
+        /// The `with` parameter is for the [`Pending<R>`] that is paired with the
+        /// responder created for the worker. This allows strategies to be made that return
+        /// different return types thats [`Pending<R>`].
+        /// 
+        /// [`Pending<R>`]: crate::Pending<R>
+        fn spawn<F: FnOnce() + Send + 'static, T>(with: T, worker: F) -> Self::Return<T>;
     }
     
     pub struct Std;
     
     impl SpawnStrategy for Std {
         type Return<T> = (T, ::std::thread::JoinHandle<()>);
+        #[inline]
         fn spawn<F: FnOnce() + Send + 'static, T>(with: T, f: F) -> Self::Return<T> {
             let handle = std::thread::spawn(f);
             (with, handle)
@@ -51,6 +62,7 @@ pub mod strategy {
     #[cfg(feature = "rayon")]
     impl SpawnStrategy for Rayon {
         type Return<T> = T;
+        #[inline]
         fn spawn<F: FnOnce() + Send + 'static, T>(with: T, f: F) -> Self::Return<T> {
             rayon::spawn(f);
             with
