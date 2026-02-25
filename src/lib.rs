@@ -20,23 +20,14 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#[derive(Debug, thiserror::Error)]
-#[error("Out of memory.")]
-pub struct OutOfMemoryError;
-
 use std::{
     alloc::{
         alloc, dealloc, Layout
     }, cell::UnsafeCell, mem::{
         MaybeUninit,
+        transmute,
     }, ptr::NonNull, sync::atomic::{AtomicU8, Ordering}
 };
-
-const TAKEN: u8 = 0;
-const WAITING: u8 = 1;
-const ASSIGNING: u8 = 2;
-const READY: u8 = 4;
-
 
 pub mod strategy {
     pub trait SpawnStrategy {
@@ -74,22 +65,110 @@ pub mod strategy {
 }
 
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
-pub enum PendingError {
-    #[error("Value already taken.")]
-    Taken,
-    #[error("Waiting for value.")]
-    Waiting,
-    #[error("Assigning value.")]
-    Assigning,
+
+#[repr(u8, align(1))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum State {
+    Taken = 0,
+    Waiting = 1,
+    Assigning = 2,
+    Ready = 3,
+}
+
+#[repr(u8, align(1))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Reason {
+    Taken = 0,
+    Waiting = 1,
+    /// The purpose of [Reason::Assigning] is so that the caller can choose to call [Pending::try_recv] immediately after.
+    /// Pseudo-code:
+    /// ```rust, ignore
+    ///  use ::std::thread::sleep;
+    ///  use ::std::time::Duration;
+    ///  let pending = Pending::spawn(|| {
+    ///      return some_expensive_function();
+    ///  });
+    ///  loop {
+    ///      // sleep in 50ms increments because the response is expected to
+    ///      // take a few seconds, but we need a tight window for the response.
+    ///      sleep(Duration::from_millis(50));
+    ///      match pending.try_recv() {
+    ///          Ok(result) => return result,
+    ///          Err(Reason::Assigning) => {
+    ///              // very brief sleep (OS may wake up later)
+    ///              sleep(Duration::from_nanos(10));
+    ///              let Ok(result) = pending.try_recv() else {
+    ///                  continue;
+    ///              };
+    ///              return result;
+    ///          }
+    ///          Err(Reason::Taken) => unreachable!(
+    ///              "This loop owns the pending instance. Nothing else can receive from it."
+    ///          ),
+    ///          Err(_) => continue,
+    ///      }
+    /// }
+    /// ```
+    Assigning = 2,
+}
+
+#[repr(transparent)]
+#[derive(Debug)]
+struct AtomicState(AtomicU8);
+
+impl AtomicState {
+    #[inline(always)]
+    const fn new(state: State) -> Self {
+        Self(AtomicU8::new(unsafe { transmute(state) }))
+    }
+    
+    #[inline(always)]
+    fn store(&self, state: State) {
+        self.0.store(unsafe { transmute(state) }, Ordering::Release);
+    }
+    
+    #[must_use]
+    #[inline(always)]
+    fn load(&self) -> State {
+        unsafe { transmute(self.0.load(Ordering::Acquire)) }
+    }
+    
+    #[inline(always)]
+    fn compare_exchange(&self, current: State, new: State) -> Result<State, State> {
+        let current: u8 = unsafe { transmute(current) };
+        let new: u8 = unsafe { transmute(new) };
+        match self.0.compare_exchange(current, new, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(previous) => Ok(unsafe { transmute(previous) }),
+            Err(previous) => Err(unsafe { transmute(previous) }),
+        }
+    }
+    
+    #[inline(always)]
+    fn is_ready(&self) -> bool {
+        self.compare_exchange(
+            State::Ready,
+            State::Ready,
+        ).is_ok()
+    }
+    
+    #[inline(always)]
+    fn take_if_ready(&self) -> Result<(), Reason> {
+        match self.compare_exchange(State::Ready, State::Taken) {
+            Ok(_) => Ok(()),
+            // SAFETY: Both State and Reason have the same layout. Reason is identical to State except that
+            // it has no `Ready` variant. The `Ready` variant is the last discriminant, so this operation is perfectly
+            // safe since the Err branch will never be `State::Ready`.
+            Err(reason) => Err(unsafe { transmute(reason) })
+        }
+    }
 }
 
 #[repr(C)]
 struct Inner<R> {
-    // we only need AtomicU8 since there can only be one sender and one receiver.
     result: UnsafeCell<MaybeUninit<R>>,
+    // we only need AtomicU8 since there can only be one sender and one receiver.
     ref_count: AtomicU8,
-    state: AtomicU8,
+    state: AtomicState,
 }
 
 impl<R> Inner<R> {
@@ -106,82 +185,114 @@ impl<R> Inner<R> {
                 result: UnsafeCell::new(MaybeUninit::uninit()),
                 // initial reference count of 2 because there is one sender and one receiver.
                 ref_count: AtomicU8::new(2),
-                state: AtomicU8::new(WAITING),
+                state: AtomicState::new(State::Waiting),
             });
             raw
         }
     }
 
     /// Decrements the reference count and drops then deallocs if the reference count becomes 0.
-    unsafe fn decrement_ref_count(raw: NonNull<Self>) -> bool {
+    unsafe fn decrement_ref_count_and_maybe_free(raw: NonNull<Self>) {
         let inner_ref = unsafe { raw.as_ref() };
         if inner_ref.ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             // SAFETY: The ref count is zero, which means that this was the last instance.
             unsafe { Self::drop_and_dealloc(raw); }
-            true
-        } else {
-            false
         }
     }
 
-    /// This function should only ever be called on the last instance.
+    /// This function should only ever be called when the ref_count reaches zero (the return value of `fetch_sub(1)` is `1`)
     unsafe fn drop_and_dealloc(mut raw: NonNull<Self>) {
-        unsafe  {
-            let inner_mut = raw.as_mut();
-            let state = inner_mut.state.load(Ordering::Acquire);
+        // temporary scope for the mutable reference to live in so it doesn't have any chance to cause conflicts.
+        {
+            // SAFETY: `drop_and_dealloc` is only called on the last handle during drop, so
+            // we are certain that the pointer points to initialized and alive memory, and
+            // we also know that we have exclusive access to it.
+            let inner_mut = unsafe { raw.as_mut() };
+            let state = inner_mut.state.load();
+            use State::*;
             match state {
-                TAKEN | WAITING => (/* Do nothing, there is no value. */),
-                ASSIGNING => unreachable!("Invalid state on cleanup."),
-                READY => inner_mut.result.get_mut().assume_init_drop(),
-                unknown => unreachable!("Unknown state: {unknown}"),
+                Taken | Waiting => (/* Do nothing, there is no value. */),
+                Assigning => unreachable!("Invalid state on cleanup."),
+                // SAFETY: `drop_and_dealloc` is only called on the last instance during drop, and a `Ready` state indicates that
+                // a value has been assigned but not taken.
+                Ready => unsafe { inner_mut.result.get_mut().assume_init_drop() },
             }
-            dealloc(raw.as_ptr().cast(), Self::LAYOUT);
         }
+        // SAFETY: we have exclusive access to the pointer, the pointer is valid, and the memory is initialized.
+        unsafe { raw.drop_in_place() };
+        // SAFETY: pointer is exclusive, valid, and points to initialized memory.
+        unsafe { dealloc(raw.as_ptr().cast(), Self::LAYOUT); }
 
     }
 }
 
+#[repr(transparent)]
+#[derive(Debug)]
+struct Handle<R> {
+    raw: NonNull<Inner<R>>,
+}
+
+impl<R: Send + 'static> Handle<R> {
+    #[must_use]
+    #[inline(always)]
+    fn pair() -> (Handle<R>, Handle<R>) {
+        let raw = Inner::<R>::alloc_new();
+        (
+            Handle { raw },
+            Handle { raw },
+        )
+    }
+    
+    #[inline(always)]
+    unsafe fn as_ref<'a>(&'a self) -> &'a Inner<R> {
+        unsafe { self.raw.as_ref() }
+    }
+}
+
+impl<R> Drop for Handle<R> {
+    fn drop(&mut self) {
+        // SAFETY: Handle is only ever created in pairs, and the ref count always starts at 2, so
+        // dropping each handle in the pair will bring the ref count to zero. The only way this
+        // operation becomes unsafe is if an extra handle were created from the same raw pointer.
+        unsafe {
+            Inner::<R>::decrement_ref_count_and_maybe_free(self.raw);
+        }
+    }
+}
+
+#[repr(transparent)]
 #[derive(Debug)]
 pub struct Pending<R: Send + 'static> {
-    raw: NonNull<Inner<R>>,
+    handle: Handle<R>,
 }
 
+#[repr(transparent)]
 #[derive(Debug)]
 pub struct Responder<R: Send + 'static> {
-    raw: NonNull<Inner<R>>,
+    handle: Handle<R>,
 }
 
-unsafe impl<R> Send for Pending<R>
-where R: Send + 'static {}
-unsafe impl<R> Sync for Pending<R>
-where R: Send + Sync + 'static {}
-
-unsafe impl<R> Send for Responder<R>
-where R: Send + 'static {}
-unsafe impl<R> Sync for Responder<R>
-where R: Send + Sync + 'static {}
-
 impl<R: Send + 'static> Responder<R> {
-    #[must_use]
-    #[inline]
-    fn from_raw(raw: NonNull<Inner<R>>) -> Self {
-        Self { raw }
+    
+    #[inline(always)]
+    fn new(handle: Handle<R>) -> Self {
+        Self { handle }
     }
 
     #[inline(always)]
     pub fn respond(self, result: R) {
-        // SAFETY: self.raw is guaranteed to be convertible to a reference.
+        // SAFETY: self.handle is guaranteed to be convertible to a reference.
         let inner_ref = unsafe {
-            self.raw.as_ref()
+            self.handle.as_ref()
         };
         // We use store because this is the only thing that can modify the value.
         // The responder is the writer, and the `Pending` is the reader.
-        inner_ref.state.store(ASSIGNING, Ordering::Release);
+        inner_ref.state.store(State::Assigning);
         // SAFETY: dst is guaranteed to be valid for writes, and is properly aligned.
         unsafe {
             inner_ref.result.get().write(MaybeUninit::new(result));
         }
-        inner_ref.state.store(READY, Ordering::Release);
+        inner_ref.state.store(State::Ready);
     }
 }
 
@@ -189,17 +300,17 @@ impl<R: Send + 'static> Pending<R> {
 
     #[must_use]
     #[inline]
-    fn from_raw(raw: NonNull<Inner<R>>) -> Self {
-        Self { raw }
+    fn new(handle: Handle<R>) -> Self {
+        Self { handle }
     }
 
     #[must_use]
     #[inline]
-    pub fn pair() -> (Self, Responder<R>) {
-        let raw = Inner::<R>::alloc_new();
+    pub fn pair() -> (Pending<R>, Responder<R>) {
+        let (recv, send) = Handle::<R>::pair();
         (
-            Self::from_raw(raw),
-            Responder::from_raw(raw)
+            Pending::new(recv),
+            Responder::new(send),
         )
     }
     
@@ -217,68 +328,39 @@ impl<R: Send + 'static> Pending<R> {
     #[inline]
     pub fn is_ready(&self) -> bool {
         let inner_ref = unsafe {
-            self.raw.as_ref()
+            self.handle.as_ref()
         };
-        inner_ref.state.compare_exchange(READY, READY, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+        inner_ref.state.is_ready()
     }
 
     #[must_use]
     #[inline]
-    pub fn try_recv(&self) -> std::result::Result<R, PendingError> {
-        unsafe {
-            let inner_ref = self.raw.as_ref();
-            match inner_ref.state.compare_exchange(READY, TAKEN, Ordering::AcqRel, Ordering::Relaxed) {
-                Ok(_) => Ok(inner_ref.result.get().read().assume_init()),
-                Err(TAKEN) => Err(PendingError::Taken),
-                Err(WAITING) => Err(PendingError::Waiting),
-                // The purpose of returning PendingError::Assigning is so that the caller can choose to call try_recv immediately after.
-                // Pseudo-code:
-                //  use ::std::thread::sleep;
-                //  use ::std::time::Duration;
-                //  let pending = Pending::spawn(|| {
-                //      return some_expensive_function();
-                //  });
-                //  loop {
-                //      // sleep in 50ms increments because the response is expected to take a few seconds, but we need a tight window for the response.
-                //      sleep(Duration::from_millis(50));
-                //      match pending.try_recv() {
-                //          Ok(result) => return result,
-                //          Err(PendingError::Assigning) => {
-                //              // very brief sleep (OS may wake up later)
-                //              sleep(Duration::from_nanos(10));
-                //              let Ok(result) = pending.try_recv() else {
-                //                  continue;
-                //              };
-                //              return result;
-                //          }
-                //          Err(PendingError::Taken) => unreachable!("This loop owns the pending instance. Nothing else can receive from it."),
-                //          Err(_) => continue,
-                //      }
-                // }
-                Err(ASSIGNING) => Err(PendingError::Assigning),
-                Err(_) => unreachable!("Corrupted state; should not be possible."),
-            }
-        }
+    pub fn try_recv(&self) -> Result<R, Reason> {
+        // SAFETY: handle is valid while self is alive.
+        let inner_ref = unsafe { self.handle.as_ref() };
+        inner_ref.state
+            .take_if_ready()
+            .map(move |_| {
+                // SAFETY: Pending now has exclusive access to the result.
+                unsafe { inner_ref.result.get().read().assume_init() }
+            })
     }
 }
 
-impl<R: Send + 'static> Drop for Pending<R> {
-    fn drop(&mut self) {
-        // SAFETY: Pending<R> owns 1 reference count. It must be decremented on drop.
-        unsafe {
-            Inner::<R>::decrement_ref_count(self.raw);
-        }
-    }
-}
+unsafe impl<R> Send for Handle<R>
+where R: Send + 'static {}
+unsafe impl<R> Sync for Handle<R>
+where R: Send + Sync + 'static {}
 
-impl<R: Send + 'static> Drop for Responder<R> {
-    fn drop(&mut self) {
-        // SAFETY: Responder<R> owns 1 reference count. It must be decremented on drop.
-        unsafe {
-            Inner::<R>::decrement_ref_count(self.raw);
-        }
-    }
-}
+unsafe impl<R> Send for Pending<R>
+where R: Send + 'static {}
+unsafe impl<R> Sync for Pending<R>
+where R: Send + Sync + 'static {}
+
+unsafe impl<R> Send for Responder<R>
+where R: Send + 'static {}
+unsafe impl<R> Sync for Responder<R>
+where R: Send + Sync + 'static {}
 
 #[must_use]
 #[inline]
