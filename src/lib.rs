@@ -316,7 +316,7 @@ type SpawnOutput<R, S> = <S as strategy::SpawnStrategy>::Return<Pending<R>>;
 impl<R: Send + 'static> Handle<R, ()> {
     #[must_use]
     #[inline(always)]
-    fn pair() -> (Handle<R, marker::Receiver>, Handle<R, marker::Sender>) {
+    fn pair() -> (Handle<R, marker::Sender>, Handle<R, marker::Receiver>) {
         let raw = Inner::<R>::alloc_new();
         (
             Handle::from_raw(raw),
@@ -420,11 +420,11 @@ impl<R: Send + 'static> Responder<R> {
 impl<R: Send + 'static> Pending<R> {
     #[must_use]
     #[inline]
-    pub fn pair() -> (Pending<R>, Responder<R>) {
-        let (receive_handle, send_handle) = Handle::<R>::pair();
+    pub fn pair() -> (Responder<R>, Pending<R>) {
+        let (send_handle, receive_handle) = Handle::<R>::pair();
         (
-            Pending { handle: receive_handle },
             Responder { handle: send_handle },
+            Pending { handle: receive_handle },
         )
     }
     
@@ -434,7 +434,7 @@ impl<R: Send + 'static> Pending<R> {
         S: strategy::SpawnStrategy,
         F: FnOnce() -> R + Send + 'static,
     {
-        let (pending, responder) = Self::pair();
+        let (responder, pending) = Self::pair();
         S::spawn(pending, #[inline(always)] move || {
             responder.respond(worker());
         })
@@ -469,7 +469,7 @@ where R: Send + Sync + 'static {}
 
 #[must_use]
 #[inline]
-pub fn pair<R>() -> (Pending<R>, Responder<R>)
+pub fn pair<R>() -> (Responder<R>, Pending<R>)
 where R: Send + 'static {
     Pending::pair()
 }
