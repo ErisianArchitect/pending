@@ -33,6 +33,7 @@ use std::{
 /// markers for different strategies. These strategies define how workers are spawned.
 pub mod strategy {
     
+    /// Defines the worker thread spawn strategy.
     pub trait SpawnStrategy {
         type Return<T>;
         /// Spawn a worker, passing in part of the return value.
@@ -93,8 +94,8 @@ enum State {
     Taken = 0,
     /// Waiting for a response.
     Waiting = 1,
-    /// The response is being written.
-    Assigning = 2,
+    /// The response will be available soon.
+    AvailableSoon = 2,
     /// The response is ready.
     Ready = 3,
 }
@@ -107,7 +108,7 @@ pub enum Reason {
     Taken = 0,
     /// Still waiting for a response.
     Waiting = 1,
-    /// The response is being written. Used to determine when you should try to receive again immediately after.
+    /// The response will be available soon. Used to determine when you should try to receive again immediately after.
     /// (You should time your delay according to how long you think it will take for the response to be written)
     /// 
     /// # Example:
@@ -125,7 +126,7 @@ pub enum Reason {
     ///      sleep(Duration::from_millis(50));
     ///      match pending.try_recv() {
     ///          Ok(result) => return result,
-    ///          Err(Reason::Assigning) => {
+    ///          Err(Reason::AvailableSoon) => {
     ///              // very brief sleep (OS may wake up later)
     ///              sleep(Duration::from_nanos(10));
     ///              let Ok(result) = pending.try_recv() else {
@@ -140,7 +141,7 @@ pub enum Reason {
     ///      }
     /// }
     /// ```
-    Assigning = 2,
+    AvailableSoon = 2,
 }
 
 /// A wrapper around [AtomicU8] that stores [State] instead of [u8].
@@ -153,6 +154,7 @@ impl AtomicState {
     /// Create a new [AtomicState] initialized to [State::Waiting].
     #[inline(always)]
     const fn new() -> Self {
+        // SAFETY: `State` is repr(u8).
         Self(AtomicU8::new(unsafe { transmute(State::Waiting) }))
     }
     
@@ -161,6 +163,7 @@ impl AtomicState {
     /// [Release]: Ordering::Release
     #[inline(always)]
     fn store(&self, state: State) {
+        // SAFETY: `State` is repr(u8).
         self.0.store(unsafe { transmute(state) }, Ordering::Release);
     }
     
@@ -170,6 +173,8 @@ impl AtomicState {
     #[must_use]
     #[inline(always)]
     fn load(&self) -> State {
+        // SAFETY: The AtomicState API forbids assignment of anything besides `State` values, so
+        // load is guaranteed to produce a valid `State`.
         unsafe { transmute(self.0.load(Ordering::Acquire)) }
     }
     
@@ -182,9 +187,12 @@ impl AtomicState {
     /// [Relaxed]: Ordering::Relaxed
     #[inline(always)]
     fn compare_exchange(&self, current: State, new: State) -> Result<State, State> {
+        // SAFETY: `State` is repr(u8).
         let current: u8 = unsafe { transmute(current) };
         let new: u8 = unsafe { transmute(new) };
         match self.0.compare_exchange(current, new, Ordering::AcqRel, Ordering::Relaxed) {
+            // SAFETY: The AtomicState API forbids assignment of anything besides `State` values, so
+            // `previous` is guaranteed to be a valid representation of a `State`.
             Ok(previous) => Ok(unsafe { transmute(previous) }),
             Err(previous) => Err(unsafe { transmute(previous) }),
         }
@@ -219,7 +227,7 @@ impl AtomicState {
     }
 }
 
-/// The shared object between a [Pending] and [Responder] pair.
+/// The shared object between a [Pending] and [Responder] pair that lives on the heap.
 #[repr(C)]
 struct Inner<R> {
     /// Stores the response given by [Responder::respond].
@@ -234,6 +242,7 @@ struct Inner<R> {
 impl<R> Inner<R> {
     const LAYOUT: Layout = Layout::new::<Self>();
 
+    /// Allocate a new [Inner<R>] on the heap and initialize it to the default state.
     fn alloc_new() -> NonNull<Inner<R>> {
         // SAFETY: layout is the exactly Layout for `Inner<R>`.
         let ptr = unsafe { alloc(Self::LAYOUT).cast() };
@@ -278,7 +287,7 @@ impl<R> Inner<R> {
                 // It shouldn't be possible for the responder to be dropped in the middle of assignment.
                 // The only reason unreachable_unchecked is not used here is because it can't be guaranteed
                 // that it won't happen.
-                Assigning => unreachable!("Invalid state on cleanup."),
+                AvailableSoon => unreachable!("Invalid state on cleanup."),
                 // SAFETY: `drop_and_dealloc` is only called on the last instance during drop, and a `Ready` state indicates that
                 // a value has been assigned but not taken.
                 Ready => unsafe { inner_mut.response.get_mut().assume_init_drop() },
@@ -292,11 +301,23 @@ impl<R> Inner<R> {
     }
 }
 
+/// Markers for the [Handle] type.
 mod marker {
+    /// The [HandleType] determines whether the [Handle] is for a Sender or a Receiver.
+    /// 
+    /// [Handle]: super::Handle
     pub trait HandleType: Send + Sized + 'static {}
     
+    /// Determines that the [Handle] is only a Sender ([Responder]).
+    /// 
+    /// [Handle]: super::Handle
+    /// [Responder]: super::Responder
     #[derive(Debug)]
     pub enum Sender {}
+    /// Determines that the [Handle] is only a Receiver ([Pending]).
+    /// 
+    /// [Handle]: super::Handle
+    /// [Pending]: super::Pending
     #[derive(Debug)]
     pub enum Receiver {}
     
@@ -304,6 +325,7 @@ mod marker {
     impl HandleType for Receiver {}
 }
 
+/// A drop handle for [NonNull<Inner<R>>].
 #[repr(transparent)]
 #[derive(Debug)]
 struct Handle<R, Type: marker::HandleType> {
@@ -328,9 +350,10 @@ impl<R: Send + 'static, Type: marker::HandleType> Handle<R, Type> {
 
 impl<R, Type: marker::HandleType> Drop for Handle<R, Type> {
     fn drop(&mut self) {
-        // SAFETY: Handle is only ever created in pairs, and the ref count always starts at 2, so
+        // SAFETY: Handle is only ever created in pairs, and the ref count always initialized to `2`, so
         // dropping each handle in the pair will bring the ref count to zero. The only way this
-        // operation becomes unsafe is if an extra handle were created from the same raw pointer.
+        // operation becomes unsafe is if there are more than two handles, or if the ref_count is
+        // initialized to something besides `2`.
         unsafe {
             Inner::<R>::decrement_ref_count_and_maybe_free(self.raw);
         }
@@ -352,6 +375,8 @@ pub struct Responder<R: Send + 'static> {
 }
 
 impl<R: Send + 'static> Responder<R> {
+    /// Send a response to the entangled [Pending]. This is a consuming operation because you are only meant to
+    /// respond once.
     #[inline(always)]
     pub fn respond(self, result: R) {
         // It might appear as if there is an aliasing bug in this code since `Inner` is
@@ -367,7 +392,7 @@ impl<R: Send + 'static> Responder<R> {
         // modifies it right here, and `respond` consumes `Responder`, so it can't be
         // called again.
         // The responder is the writer, and the `Pending` is the reader.
-        inner_ref.state.store(State::Assigning);
+        inner_ref.state.store(State::AvailableSoon);
         // SAFETY: Writing into `UnsafeCell` on valid reference with properly aligned data.
         unsafe {
             inner_ref.response.get().write(MaybeUninit::new(result));
@@ -377,6 +402,7 @@ impl<R: Send + 'static> Responder<R> {
 }
 
 impl<R: Send + 'static> Pending<R> {
+    /// Checks if the response is ready without consuming it.
     #[must_use]
     #[inline]
     pub fn is_ready(&self) -> bool {
@@ -387,6 +413,19 @@ impl<R: Send + 'static> Pending<R> {
         inner_ref.state.is_ready()
     }
 
+    /// Tries to take the response if it is available, otherwise returns the reason that
+    /// the operation failed.
+    /// 
+    /// Reasons:
+    /// * [Reason::Waiting] - Still waiting for a response. You should wait an appropriate amount of time
+    /// before trying again.
+    /// * [Reason::AvailableSoon] - The response will be available soon, often immediately after the call
+    /// returns. This [Reason] is the result of the [Responder] being in the process of writing the value
+    /// but is not yet ready.
+    /// * [Reason::Taken] - The response has already been taken. You should consider this an error for
+    /// your program in cases where your intention is to stop trying after a value is taken. After a
+    /// value is taken, there will never be another value available again. Receiving is a oneshot 
+    /// operation.
     #[inline]
     pub fn try_recv(&self) -> Result<R, Reason> {
         // SAFETY: handle is valid while self is alive.
@@ -409,6 +448,7 @@ unsafe impl<R: Send + Sync + 'static> Sync for Pending<R> {}
 unsafe impl<R: Send + 'static> Send for Responder<R> {}
 unsafe impl<R: Send + Sync + 'static> Sync for Responder<R> {}
 
+/// Create a Sender/Receiver ([Responder<R>]/[Pending<R>]).
 #[must_use]
 #[inline]
 pub fn pair<R>() -> (Responder<R>, Pending<R>)
@@ -420,6 +460,7 @@ where R: Send + 'static {
     )
 }
 
+/// Spawn a worker thread using the given strategy.
 #[must_use]
 #[inline]
 pub fn spawn<S, R, F>(worker: F) -> SpawnOutput<R, S>
@@ -434,6 +475,7 @@ where
     })
 }
 
+/// Spawn a worker thread using the standard library threading API.
 #[must_use]
 #[inline]
 pub fn spawn_std<R, F>(worker: F) -> SpawnOutput<R, strategy::Std>
@@ -444,6 +486,8 @@ where
     spawn::<strategy::Std, R, F>(worker)
 }
 
+
+/// Spawn a rayon worker thread.
 #[cfg(feature = "rayon")]
 #[must_use]
 #[inline]
