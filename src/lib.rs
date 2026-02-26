@@ -49,7 +49,7 @@ pub mod strategy {
     /// 
     /// [`Pending<R>`]: crate::Pending<R>
     /// [`Thread`]: std::thread::Thread
-    pub struct Std;
+    pub enum Std {}
     
     impl SpawnStrategy for Std {
         type Return<T> = (T, ::std::thread::JoinHandle<()>);
@@ -64,7 +64,7 @@ pub mod strategy {
     /// 
     /// [`Pending<R>`]: crate::Pending
     #[cfg(feature = "rayon")]
-    pub struct Rayon;
+    pub enum Rayon {}
     
     #[cfg(feature = "rayon")]
     impl SpawnStrategy for Rayon {
