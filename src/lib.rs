@@ -313,15 +313,6 @@ type SendHandle<R> = Handle<R, marker::Sender>;
 type RecvHandle<R> = Handle<R, marker::Receiver>;
 type SpawnOutput<R, S> = <S as strategy::SpawnStrategy>::Return<Pending<R>>;
 
-#[inline(always)]
-fn handle_pair<R: Send + 'static>() -> (SendHandle<R>, RecvHandle<R>) {
-    let raw = Inner::<R>::alloc_new();
-    (
-        Handle::from_raw(raw),
-        Handle::from_raw(raw),
-    )
-}
-
 impl<R: Send + 'static, Type: marker::HandleType> Handle<R, Type> {
     #[must_use]
     #[inline(always)]
@@ -446,10 +437,10 @@ where R: Send + Sync + 'static {}
 #[inline]
 pub fn pair<R>() -> (Responder<R>, Pending<R>)
 where R: Send + 'static {
-    let (send_handle, receive_handle) = handle_pair();
+    let raw = Inner::<R>::alloc_new();
     (
-        Responder { handle: send_handle },
-        Pending { handle: receive_handle },
+        Responder { handle: Handle::from_raw(raw) },
+        Pending { handle: Handle::from_raw(raw) },
     )
 }
 
