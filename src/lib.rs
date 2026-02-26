@@ -313,22 +313,19 @@ type SendHandle<R> = Handle<R, marker::Sender>;
 type RecvHandle<R> = Handle<R, marker::Receiver>;
 type SpawnOutput<R, S> = <S as strategy::SpawnStrategy>::Return<Pending<R>>;
 
-impl<R: Send + 'static> Handle<R, ()> {
-    #[must_use]
-    #[inline(always)]
-    fn pair() -> (Handle<R, marker::Sender>, Handle<R, marker::Receiver>) {
-        let raw = Inner::<R>::alloc_new();
-        (
-            Handle::from_raw(raw),
-            Handle::from_raw(raw),
-        )
-    }
+#[inline(always)]
+fn handle_pair<R: Send + 'static>() -> (SendHandle<R>, RecvHandle<R>) {
+    let raw = Inner::<R>::alloc_new();
+    (
+        Handle::from_raw(raw),
+        Handle::from_raw(raw),
+    )
 }
 
 impl<R: Send + 'static, Type: marker::HandleType> Handle<R, Type> {
     #[must_use]
     #[inline(always)]
-    const fn from_raw(raw: NonNull<Inner<R>>) -> Self {
+    fn from_raw(raw: NonNull<Inner<R>>) -> Self {
         Self {
             raw,
             _phantom: PhantomData,
@@ -420,28 +417,6 @@ impl<R: Send + 'static> Responder<R> {
 impl<R: Send + 'static> Pending<R> {
     #[must_use]
     #[inline]
-    pub fn pair() -> (Responder<R>, Pending<R>) {
-        let (send_handle, receive_handle) = Handle::<R>::pair();
-        (
-            Responder { handle: send_handle },
-            Pending { handle: receive_handle },
-        )
-    }
-    
-    #[must_use]
-    pub fn spawn<S, F>(worker: F) -> S::Return<Self>
-    where
-        S: strategy::SpawnStrategy,
-        F: FnOnce() -> R + Send + 'static,
-    {
-        let (responder, pending) = Self::pair();
-        S::spawn(pending, #[inline(always)] move || {
-            responder.respond(worker());
-        })
-    }
-
-    #[must_use]
-    #[inline]
     pub fn is_ready(&self) -> bool {
         self.handle.is_ready()
     }
@@ -471,7 +446,11 @@ where R: Send + Sync + 'static {}
 #[inline]
 pub fn pair<R>() -> (Responder<R>, Pending<R>)
 where R: Send + 'static {
-    Pending::pair()
+    let (send_handle, receive_handle) = handle_pair();
+    (
+        Responder { handle: send_handle },
+        Pending { handle: receive_handle },
+    )
 }
 
 #[must_use]
@@ -482,7 +461,10 @@ where
     R: Send + 'static,
     F: FnOnce() -> R + Send + 'static, 
 {
-    Pending::spawn::<S, _>(worker)
+    let (responder, pending) = pair();
+    S::spawn(pending, #[inline(always)] move || {
+        responder.respond(worker());
+    })
 }
 
 #[must_use]
