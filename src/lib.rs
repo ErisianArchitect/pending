@@ -235,23 +235,25 @@ impl<R> Inner<R> {
     const LAYOUT: Layout = Layout::new::<Self>();
 
     fn alloc_new() -> NonNull<Inner<R>> {
+        // SAFETY: layout is the exactly Layout for `Inner<R>`.
+        let ptr = unsafe { alloc(Self::LAYOUT).cast() };
+        let Some(raw) = NonNull::new(ptr) else {
+            handle_alloc_error(Self::LAYOUT);
+        };
+        // SAFETY: `raw` points to valid uninitialized memory of the correct size and alignment for `Self`.
         unsafe {
-            let layout = Self::LAYOUT;
-            let ptr = alloc(layout).cast();
-            let Some(raw) = NonNull::new(ptr) else {
-                handle_alloc_error(Self::LAYOUT);
-            };
             raw.write(Self {
                 response: UnsafeCell::new(MaybeUninit::uninit()),
                 // initial reference count of 2 because there is one sender and one receiver.
                 ref_count: AtomicU8::new(2),
                 state: AtomicState::new(),
             });
-            raw
         }
+        raw
     }
 
     /// Decrements the reference count and drops then deallocs if the reference count becomes 0.
+    /// SAFETY: `raw` must point to a valid [Inner] instance with properly aligned memory.
     unsafe fn decrement_ref_count_and_maybe_free(raw: NonNull<Self>) {
         let inner_ref = unsafe { raw.as_ref() };
         if inner_ref.ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -260,7 +262,8 @@ impl<R> Inner<R> {
         }
     }
 
-    /// This function should only ever be called when the ref_count reaches zero (the return value of `fetch_sub(1)` is `1`)
+    /// drops the Inner and then deallocates it.
+    /// SAFETY: This function should only ever be called when the ref_count reaches zero (the return value of `fetch_sub(1)` is `1`)
     unsafe fn drop_and_dealloc(mut raw: NonNull<Self>) {
         // temporary scope for the mutable reference (`inner_mut`) to live in so it doesn't have any chance to cause conflicts.
         {
@@ -299,12 +302,11 @@ mod marker {
     
     impl HandleType for Sender {}
     impl HandleType for Receiver {}
-    impl HandleType for () {}
 }
 
 #[repr(transparent)]
 #[derive(Debug)]
-struct Handle<R, Type: marker::HandleType = ()> {
+struct Handle<R, Type: marker::HandleType> {
     raw: NonNull<Inner<R>>,
     _phantom: PhantomData<*const Type>,
 }
@@ -321,55 +323,6 @@ impl<R: Send + 'static, Type: marker::HandleType> Handle<R, Type> {
             raw,
             _phantom: PhantomData,
         }
-    }
-}
-
-impl<R> Handle<R, marker::Receiver>
-where R: Send + 'static {
-    #[inline(always)]
-    fn is_ready(&self) -> bool {
-        let inner_ref = unsafe {
-            self.raw.as_ref()
-        };
-        inner_ref.state.is_ready()
-    }
-    
-    #[inline(always)]
-    fn try_recv(&self) -> Result<R, Reason> {
-        // SAFETY: handle is valid while self is alive.
-        let inner_ref = unsafe { self.raw.as_ref() };
-        inner_ref.state
-            .take_if_ready()
-            .map(move |_| {
-                // SAFETY: Handle now has exclusive access to the response.
-                unsafe { inner_ref.response.get().read().assume_init() }
-            })
-    }
-}
-
-impl<R> Handle<R, marker::Sender>
-where R: Send + 'static {
-    #[inline(always)]
-    fn respond(self, result: R) {
-        // It might appear as if there is an aliasing bug in this code since `Inner` is
-        // repr(C), and `response` is the first field, but `response` is UnsafeCell, which
-        // prevents aliasing bugs.
-        
-        // SAFETY: self.handle is guaranteed to be convertible to a reference.
-        let inner_ref = unsafe {
-            self.raw.as_ref()
-        };
-        // We use store because this is the only thing that can modify the value
-        // while the state is `Waiting`, and the state is always waiting until `respond`
-        // modifies it right here, and `respond` consumes `Responder`, so it can't be
-        // called again.
-        // The responder is the writer, and the `Pending` is the reader.
-        inner_ref.state.store(State::Assigning);
-        // SAFETY: dst is guaranteed to be valid for writes, and is properly aligned.
-        unsafe {
-            inner_ref.response.get().write(MaybeUninit::new(result));
-        }
-        inner_ref.state.store(State::Ready);
     }
 }
 
@@ -401,7 +354,25 @@ pub struct Responder<R: Send + 'static> {
 impl<R: Send + 'static> Responder<R> {
     #[inline(always)]
     pub fn respond(self, result: R) {
-        self.handle.respond(result);
+        // It might appear as if there is an aliasing bug in this code since `Inner` is
+        // repr(C), and `response` is the first field, but `response` is UnsafeCell, which
+        // prevents aliasing bugs.
+        
+        // SAFETY: handle is valid while self is alive.
+        let inner_ref = unsafe {
+            self.handle.raw.as_ref()
+        };
+        // We use store because this is the only thing that can modify the value
+        // while the state is `Waiting`, and the state is always waiting until `respond`
+        // modifies it right here, and `respond` consumes `Responder`, so it can't be
+        // called again.
+        // The responder is the writer, and the `Pending` is the reader.
+        inner_ref.state.store(State::Assigning);
+        // SAFETY: Writing into `UnsafeCell` on valid reference with properly aligned data.
+        unsafe {
+            inner_ref.response.get().write(MaybeUninit::new(result));
+        }
+        inner_ref.state.store(State::Ready);
     }
 }
 
@@ -409,29 +380,34 @@ impl<R: Send + 'static> Pending<R> {
     #[must_use]
     #[inline]
     pub fn is_ready(&self) -> bool {
-        self.handle.is_ready()
+        // SAFETY: handle is valid while self is alive.
+        let inner_ref = unsafe {
+            self.handle.raw.as_ref()
+        };
+        inner_ref.state.is_ready()
     }
 
     #[inline]
     pub fn try_recv(&self) -> Result<R, Reason> {
-        self.handle.try_recv()
+        // SAFETY: handle is valid while self is alive.
+        let inner_ref = unsafe { self.handle.raw.as_ref() };
+        inner_ref.state
+            .take_if_ready()
+            .map(move |_| {
+                // SAFETY: Handle now has exclusive access to the response.
+                unsafe { inner_ref.response.get().read().assume_init() }
+            })
     }
 }
 
-unsafe impl<R> Send for Handle<R>
-where R: Send + 'static {}
-unsafe impl<R> Sync for Handle<R>
-where R: Send + Sync + 'static {}
+unsafe impl<R: Send + 'static, Type: marker::HandleType> Send for Handle<R, Type> {}
+unsafe impl<R: Send + Sync + 'static, Type: marker::HandleType> Sync for Handle<R, Type> {}
 
-unsafe impl<R> Send for Pending<R>
-where R: Send + 'static {}
-unsafe impl<R> Sync for Pending<R>
-where R: Send + Sync + 'static {}
+unsafe impl<R: Send + 'static> Send for Pending<R> {}
+unsafe impl<R: Send + Sync + 'static> Sync for Pending<R> {}
 
-unsafe impl<R> Send for Responder<R>
-where R: Send + 'static {}
-unsafe impl<R> Sync for Responder<R>
-where R: Send + Sync + 'static {}
+unsafe impl<R: Send + 'static> Send for Responder<R> {}
+unsafe impl<R: Send + Sync + 'static> Sync for Responder<R> {}
 
 #[must_use]
 #[inline]
