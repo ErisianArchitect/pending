@@ -1,7 +1,7 @@
 [package]
 name = "pending"
 authors = ["ErisianArchitect <https://github.com/ErisianArchitect>"]
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 repository = "https://github.com/ErisianArchitect/pending"
 description = "A library for a lockfree worker thread responder for communicating a value back to the caller thread."

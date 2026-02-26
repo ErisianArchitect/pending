@@ -491,6 +491,10 @@ where
 #[cfg(feature = "rayon")]
 #[must_use]
 #[inline]
-pub fn spawn_rayon<R, F>(worker: F) -> SpawnOutput<R, strategy::Rayon> {
+pub fn spawn_rayon<R, F>(worker: F) -> SpawnOutput<R, strategy::Rayon>
+where
+    R: Send + 'static,
+    F: FnOnce() -> R + Send + 'static,
+{
     spawn::<strategy::Rayon, R, F>(worker)
 }
